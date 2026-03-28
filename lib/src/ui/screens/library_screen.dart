@@ -50,7 +50,7 @@ class LibraryScreen extends ConsumerWidget {
                   onPressed: () => context.push(AppRoutes.readerPath(book.id)),
                   tooltip: 'Read',
                 ),
-                onTap: () => context.push(AppRoutes.bookDetailsPath(book.id)),
+                onTap: () => context.push(AppRoutes.readerPath(book.id)),
               );
             },
           );

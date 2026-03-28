@@ -1,11 +1,25 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../domain/models/book.dart';
 import '../../domain/models/chapter.dart';
 import '../../domain/models/reading_progress.dart';
 import '../controllers/library_controller.dart';
 import '../controllers/reader_settings_controller.dart';
 import '../controllers/reading_progress_controller.dart';
+import '../providers/app_providers.dart';
+
+typedef ChapterTextRequest = ({String epubPath, String chapterHref});
+
+final chapterTextProvider =
+    FutureProvider.family<String, ChapterTextRequest>((ref, request) {
+  return ref.read(epubContentServiceProvider).extractChapterText(
+        epubPath: request.epubPath,
+        chapterHref: request.chapterHref,
+      );
+});
 
 class ReaderScreen extends ConsumerStatefulWidget {
   const ReaderScreen({super.key, required this.bookId});
@@ -19,6 +33,13 @@ class ReaderScreen extends ConsumerStatefulWidget {
 class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   bool _progressInitialized = false;
   int _currentChapterIndex = 0;
+  List<Chapter> _activeChapters = const [];
+
+  @override
+  void dispose() {
+    unawaited(_persistCurrentProgress());
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -70,38 +91,54 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       );
     }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Reader'),
-      ),
-      body: _buildReaderBody(
-        context,
-        book.chapters,
-        settings.fontSize,
-        settings.pageMargin,
-        progress,
+    return PopScope(
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          unawaited(_persistCurrentProgress());
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(book.title),
+        ),
+        body: _buildReaderBody(
+          context,
+          book,
+          settings.fontSize,
+          settings.pageMargin,
+          progress,
+        ),
       ),
     );
   }
 
   Widget _buildReaderBody(
     BuildContext context,
-    List<Chapter> chapters,
+    Book book,
     double fontSize,
     double pageMargin,
     ReadingProgress? progress,
   ) {
+    final chapters = book.chapters;
+    _activeChapters = chapters;
+
     if (chapters.isEmpty) {
       return const Center(child: Text('No chapters available yet.'));
     }
 
-    if (!_progressInitialized && progress != null) {
+    if (!_progressInitialized) {
       _currentChapterIndex =
-          progress.chapterIndex.clamp(0, chapters.length - 1);
+          (progress?.chapterIndex ?? 0).clamp(0, chapters.length - 1);
       _progressInitialized = true;
     }
 
     final chapter = chapters[_currentChapterIndex];
+    final chapterTextAsync = ref.watch(
+      chapterTextProvider((
+        epubPath: book.filePath,
+        chapterHref: chapter.href,
+      )),
+    );
 
     return Padding(
       padding: EdgeInsets.all(pageMargin),
@@ -110,13 +147,22 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         children: [
           Text(chapter.title, style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 12),
-          Text(
-            'EPUB rendering placeholder.\n\n'
-            'TODO: plug in a real EPUB renderer and CFI-based position tracking.\n'
-            'Current chapter href: ${chapter.href}',
-            style: TextStyle(fontSize: fontSize),
+          Expanded(
+            child: chapterTextAsync.when(
+              data: (text) => SingleChildScrollView(
+                child: Text(
+                  text,
+                  style: TextStyle(fontSize: fontSize, height: 1.5),
+                ),
+              ),
+              error: (error, _) => Text(
+                'Failed to load chapter: $error',
+                style: TextStyle(fontSize: fontSize),
+              ),
+              loading: () => const Center(child: CircularProgressIndicator()),
+            ),
           ),
-          const Spacer(),
+          const SizedBox(height: 12),
           Row(
             children: [
               OutlinedButton(
@@ -135,16 +181,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
               const Spacer(),
               FilledButton(
                 onPressed: () async {
-                  final saveProgress = ReadingProgress(
-                    bookId: widget.bookId,
-                    chapterId: chapter.id,
-                    chapterIndex: _currentChapterIndex,
-                    progression: (_currentChapterIndex + 1) / chapters.length,
-                    updatedAt: DateTime.now(),
-                  );
-                  await ref
-                      .read(readingProgressControllerProvider)
-                      .saveProgress(saveProgress);
+                  await _persistCurrentProgress();
                   if (!context.mounted) {
                     return;
                   }
@@ -159,5 +196,23 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         ],
       ),
     );
+  }
+
+  Future<void> _persistCurrentProgress() async {
+    if (_activeChapters.isEmpty) {
+      return;
+    }
+
+    final safeIndex = _currentChapterIndex.clamp(0, _activeChapters.length - 1);
+    final chapter = _activeChapters[safeIndex];
+    final progress = ReadingProgress(
+      bookId: widget.bookId,
+      chapterId: chapter.id,
+      chapterIndex: safeIndex,
+      progression: (safeIndex + 1) / _activeChapters.length,
+      updatedAt: DateTime.now(),
+    );
+
+    await ref.read(readingProgressControllerProvider).saveProgress(progress);
   }
 }
