@@ -11,8 +11,10 @@ abstract final class AppRoutes {
   static const reader = '/reader/:bookId';
   static const settings = '/settings';
 
-  static String bookDetailsPath(String bookId) => '/book/$bookId';
-  static String readerPath(String bookId) => '/reader/$bookId';
+  static String bookDetailsPath(String bookId) =>
+      '/book/${Uri.encodeComponent(bookId)}';
+  static String readerPath(String bookId) =>
+      '/reader/${Uri.encodeComponent(bookId)}';
 }
 
 final appRouter = GoRouter(
@@ -25,14 +27,14 @@ final appRouter = GoRouter(
     GoRoute(
       path: AppRoutes.bookDetails,
       builder: (context, state) {
-        final bookId = state.pathParameters['bookId']!;
+        final bookId = Uri.decodeComponent(state.pathParameters['bookId']!);
         return BookDetailsScreen(bookId: bookId);
       },
     ),
     GoRoute(
       path: AppRoutes.reader,
       builder: (context, state) {
-        final bookId = state.pathParameters['bookId']!;
+        final bookId = Uri.decodeComponent(state.pathParameters['bookId']!);
         return ReaderScreen(bookId: bookId);
       },
     ),

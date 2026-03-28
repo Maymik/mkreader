@@ -24,11 +24,12 @@ class SqliteReadingProgressRepository implements ReadingProgressRepository {
     }
 
     final row = rows.first;
+    final rawProgression = row['progression'];
     return ReadingProgress(
       bookId: row['book_id'] as String,
       chapterId: row['chapter_id'] as String?,
       chapterIndex: row['chapter_index'] as int,
-      progression: row['progression'] as double,
+      progression: (rawProgression as num).toDouble(),
       cfi: row['cfi'] as String?,
       updatedAt: DateTime.parse(row['updated_at'] as String),
     );

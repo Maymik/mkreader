@@ -18,6 +18,7 @@ class SqliteLibraryRepository implements LibraryRepository {
       'books',
       {
         'id': book.id,
+        'source_identifier': book.sourceIdentifier,
         'title': book.title,
         'author': book.author,
         'description': book.description,
@@ -66,6 +67,7 @@ class SqliteLibraryRepository implements LibraryRepository {
 
     return Book(
       id: row['id'] as String,
+      sourceIdentifier: row['source_identifier'] as String?,
       title: row['title'] as String,
       author: row['author'] as String?,
       description: row['description'] as String?,
