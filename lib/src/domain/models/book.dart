@@ -6,6 +6,7 @@ class Book {
     required this.title,
     required this.filePath,
     required this.importedAt,
+    this.sourceIdentifier,
     this.author,
     this.description,
     this.coverPath,
@@ -15,6 +16,7 @@ class Book {
   });
 
   final String id;
+  final String? sourceIdentifier;
   final String title;
   final String? author;
   final String? description;
@@ -27,6 +29,7 @@ class Book {
 
   Book copyWith({
     String? id,
+    String? sourceIdentifier,
     String? title,
     String? author,
     String? description,
@@ -39,6 +42,7 @@ class Book {
   }) {
     return Book(
       id: id ?? this.id,
+      sourceIdentifier: sourceIdentifier ?? this.sourceIdentifier,
       title: title ?? this.title,
       author: author ?? this.author,
       description: description ?? this.description,

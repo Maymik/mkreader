@@ -16,14 +16,19 @@ class LibraryController extends AsyncNotifier<List<Book>> {
     return ref.read(libraryRepositoryProvider).getBooks();
   }
 
-  Future<void> importEpub() async {
-    final importedBook =
-        await ref.read(epubImportServiceProvider).importFromDeviceStorage();
-    if (importedBook == null) {
-      return;
-    }
+  Future<String?> importEpub() async {
+    try {
+      final importedBook =
+          await ref.read(epubImportServiceProvider).importFromDeviceStorage();
+      if (importedBook == null) {
+        return null;
+      }
 
-    await ref.read(libraryRepositoryProvider).addBook(importedBook);
-    state = AsyncData(await ref.read(libraryRepositoryProvider).getBooks());
+      await ref.read(libraryRepositoryProvider).addBook(importedBook);
+      state = AsyncData(await ref.read(libraryRepositoryProvider).getBooks());
+      return null;
+    } catch (error) {
+      return error.toString();
+    }
   }
 }

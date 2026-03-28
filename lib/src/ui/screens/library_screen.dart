@@ -24,8 +24,16 @@ class LibraryScreen extends ConsumerWidget {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () =>
-            ref.read(libraryControllerProvider.notifier).importEpub(),
+        onPressed: () async {
+          final error =
+              await ref.read(libraryControllerProvider.notifier).importEpub();
+          if (!context.mounted || error == null || error.isEmpty) {
+            return;
+          }
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(error)),
+          );
+        },
         icon: const Icon(Icons.file_open),
         label: const Text('Import EPUB'),
       ),

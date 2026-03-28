@@ -14,24 +14,64 @@ class FilePickerEpubImportService implements EpubImportService {
   @override
   Future<Book?> importFromDeviceStorage() async {
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['epub'],
+      // Android providers may not expose .epub correctly with custom filters.
+      type: FileType.any,
+      allowMultiple: false,
       withData: false,
     );
 
-    final pickedPath = result?.files.single.path;
-    if (pickedPath == null) {
+    if (result == null || result.files.isEmpty) {
       return null;
+    }
+
+    final pickedFile = result.files.single;
+    final pickedPath = pickedFile.path;
+    if (pickedPath == null) {
+      throw const EpubImportException(
+        'Unable to access selected file path. Please pick a local EPUB file.',
+      );
+    }
+
+    final isValidEpub = await _isValidEpubSelection(
+      file: pickedFile,
+      filePath: pickedPath,
+    );
+    if (!isValidEpub) {
+      throw const EpubImportException(
+        'Selected file is not a valid EPUB. Please choose a .epub book file.',
+      );
     }
 
     final parserResult = await _parseEpub(pickedPath);
     final fallbackTitle = p.basenameWithoutExtension(pickedPath);
-    final bookId = parserResult.identifier?.trim().isNotEmpty == true
-        ? parserResult.identifier!.trim()
-        : pickedPath;
+    final bookId = _buildLocalBookId();
+    final normalizedSourceIdentifier = parserResult.identifier?.trim();
+    final sourceIdentifier = (normalizedSourceIdentifier != null &&
+            normalizedSourceIdentifier.isNotEmpty)
+        ? normalizedSourceIdentifier
+        : null;
+    final chapters = parserResult.chapters.isNotEmpty
+        ? parserResult.chapters
+            .map(
+              (chapter) => chapter.copyWith(
+                id: 'ch_${bookId}_${chapter.index}',
+                bookId: bookId,
+              ),
+            )
+            .toList()
+        : [
+            Chapter(
+              id: 'ch_${bookId}_0',
+              bookId: bookId,
+              title: 'Start',
+              index: 0,
+              href: 'placeholder.xhtml',
+            ),
+          ];
 
     return Book(
       id: bookId,
+      sourceIdentifier: sourceIdentifier,
       title: parserResult.title?.trim().isNotEmpty == true
           ? parserResult.title!.trim()
           : fallbackTitle,
@@ -40,17 +80,7 @@ class FilePickerEpubImportService implements EpubImportService {
           : 'Unknown author',
       filePath: pickedPath,
       importedAt: DateTime.now(),
-      chapters: parserResult.chapters.isNotEmpty
-          ? parserResult.chapters
-          : [
-              Chapter(
-                id: 'ch_${bookId}_0',
-                bookId: bookId,
-                title: 'Start',
-                index: 0,
-                href: 'placeholder.xhtml',
-              ),
-            ],
+      chapters: chapters,
     );
   }
 
@@ -66,13 +96,10 @@ class FilePickerEpubImportService implements EpubImportService {
 
       final containerXml = _readString(containerEntry);
       final containerDoc = XmlDocument.parse(containerXml);
-      final rootfileElement = containerDoc
-          .findAllElements('rootfile')
-          .cast<XmlElement?>()
-          .firstWhere(
-            (element) => element != null,
-            orElse: () => null,
-          );
+      final rootfileElement = containerDoc.descendants
+          .whereType<XmlElement>()
+          .where((element) => element.name.local == 'rootfile')
+          .firstOrNull;
 
       final opfPath = rootfileElement?.getAttribute('full-path');
       if (opfPath == null || opfPath.isEmpty) {
@@ -105,34 +132,45 @@ class FilePickerEpubImportService implements EpubImportService {
       );
 
       final manifestElement = opfDoc.findAllElements('manifest').firstOrNull;
-      final manifestById = <String, String>{};
+      final manifestById = <String, _ManifestItem>{};
       if (manifestElement != null) {
         for (final item in manifestElement.findElements('item')) {
           final id = item.getAttribute('id');
           final href = item.getAttribute('href');
           if (id != null && href != null) {
-            manifestById[id] = href;
+            manifestById[id] = _ManifestItem(
+              href: href,
+              mediaType: item.getAttribute('media-type'),
+              properties: item.getAttribute('properties'),
+            );
           }
         }
       }
 
       final opfDir = p.dirname(opfPath);
+      final tocByHref = _readTocTitles(
+        archive: archive,
+        opfDir: opfDir,
+        opfDoc: opfDoc,
+        manifestById: manifestById,
+      );
       final spineElement = opfDoc.findAllElements('spine').firstOrNull;
       final chapters = <Chapter>[];
       if (spineElement != null) {
         var index = 0;
         for (final itemRef in spineElement.findElements('itemref')) {
           final idRef = itemRef.getAttribute('idref');
-          final href = idRef == null ? null : manifestById[idRef];
-          if (href == null) {
+          final manifestItem = idRef == null ? null : manifestById[idRef];
+          if (manifestItem == null) {
             continue;
           }
-          final resolvedHref = p.normalize(p.join(opfDir, href));
+          final resolvedHref =
+              p.posix.normalize(p.join(opfDir, manifestItem.href));
           chapters.add(
             Chapter(
               id: 'ch_${identifier ?? filePath}_$index',
               bookId: identifier ?? filePath,
-              title: 'Chapter ${index + 1}',
+              title: tocByHref[resolvedHref] ?? 'Chapter ${index + 1}',
               index: index,
               href: resolvedHref,
             ),
@@ -162,7 +200,8 @@ class FilePickerEpubImportService implements EpubImportService {
     }
 
     if (uniqueIdentifierId != null && uniqueIdentifierId.isNotEmpty) {
-      for (final idElement in metadataElement.findElements('dc:identifier')) {
+      for (final idElement
+          in _elementsByLocalName(metadataElement, 'identifier')) {
         if (idElement.getAttribute('id') == uniqueIdentifierId) {
           final text = idElement.innerText.trim();
           if (text.isNotEmpty) {
@@ -172,18 +211,14 @@ class FilePickerEpubImportService implements EpubImportService {
       }
     }
 
-    final fallback = metadataElement.findElements('dc:identifier').firstOrNull;
+    final fallback =
+        _elementsByLocalName(metadataElement, 'identifier').firstOrNull;
     final fallbackText = fallback?.innerText.trim();
     if (fallbackText != null && fallbackText.isNotEmpty) {
       return fallbackText;
     }
 
-    // TODO: support EPUBs that do not use dc namespace prefixes.
-    return metadataElement
-        .findElements('identifier')
-        .firstOrNull
-        ?.innerText
-        .trim();
+    return null;
   }
 
   String? _firstText(XmlElement? root, List<String> elementNames) {
@@ -191,13 +226,130 @@ class FilePickerEpubImportService implements EpubImportService {
       return null;
     }
 
-    for (final name in elementNames) {
-      final text = root.findElements(name).firstOrNull?.innerText.trim();
+    for (final name
+        in elementNames.map((e) => e.contains(':') ? e.split(':').last : e)) {
+      final text =
+          _elementsByLocalName(root, name).firstOrNull?.innerText.trim();
       if (text != null && text.isNotEmpty) {
         return text;
       }
     }
     return null;
+  }
+
+  Map<String, String> _readTocTitles({
+    required Archive archive,
+    required String opfDir,
+    required XmlDocument opfDoc,
+    required Map<String, _ManifestItem> manifestById,
+  }) {
+    final titles = <String, String>{};
+
+    final spineElement = opfDoc.findAllElements('spine').firstOrNull;
+    final tocIdRef = spineElement?.getAttribute('toc');
+    final explicitNcxHref =
+        tocIdRef == null ? null : manifestById[tocIdRef]?.href;
+    final ncxHref = explicitNcxHref ??
+        manifestById.values
+            .firstWhere(
+              (item) => item.mediaType == 'application/x-dtbncx+xml',
+              orElse: () => const _ManifestItem(href: ''),
+            )
+            .href;
+    if (ncxHref.isNotEmpty) {
+      final ncxPath = p.posix.normalize(p.join(opfDir, ncxHref));
+      titles.addAll(_parseNcxToc(archive, ncxPath, opfDir));
+    }
+
+    final navHref = manifestById.values
+        .firstWhere(
+          (item) => (item.properties ?? '').split(' ').contains('nav'),
+          orElse: () => const _ManifestItem(href: ''),
+        )
+        .href;
+    if (navHref.isNotEmpty) {
+      final navPath = p.posix.normalize(p.join(opfDir, navHref));
+      titles.addAll(_parseNavXhtmlToc(archive, navPath, opfDir));
+    }
+
+    return titles;
+  }
+
+  Map<String, String> _parseNcxToc(
+      Archive archive, String ncxPath, String opfDir) {
+    final entry = _findEntry(archive, ncxPath);
+    if (entry == null) {
+      return const {};
+    }
+
+    final map = <String, String>{};
+    try {
+      final doc = XmlDocument.parse(_readString(entry));
+      final navPoints = doc.descendants.whereType<XmlElement>().where(
+            (element) => element.name.local == 'navPoint',
+          );
+      for (final navPoint in navPoints) {
+        final content = _elementsByLocalName(navPoint, 'content').firstOrNull;
+        final rawSrc = content?.getAttribute('src');
+        if (rawSrc == null || rawSrc.isEmpty) {
+          continue;
+        }
+        final normalizedSrc = p.posix.normalize(
+          p.join(opfDir, rawSrc.split('#').first),
+        );
+        final label = _elementsByLocalName(navPoint, 'text')
+            .firstOrNull
+            ?.innerText
+            .trim();
+        if (label != null && label.isNotEmpty) {
+          map[normalizedSrc] = label;
+        }
+      }
+    } catch (_) {
+      // TODO: report malformed NCX.
+    }
+    return map;
+  }
+
+  Map<String, String> _parseNavXhtmlToc(
+      Archive archive, String navPath, String opfDir) {
+    final entry = _findEntry(archive, navPath);
+    if (entry == null) {
+      return const {};
+    }
+
+    final map = <String, String>{};
+    try {
+      final doc = XmlDocument.parse(_readString(entry));
+      final links = doc.descendants.whereType<XmlElement>().where(
+            (element) => element.name.local == 'a',
+          );
+      for (final link in links) {
+        final href = link.getAttribute('href');
+        if (href == null || href.isEmpty) {
+          continue;
+        }
+        final normalizedHref = p.posix.normalize(
+          p.join(opfDir, href.split('#').first),
+        );
+        final text = link.innerText.trim();
+        if (text.isNotEmpty) {
+          map[normalizedHref] = text;
+        }
+      }
+    } catch (_) {
+      // TODO: report malformed NAV document.
+    }
+    return map;
+  }
+
+  Iterable<XmlElement> _elementsByLocalName(
+      XmlElement root, String localName) sync* {
+    for (final element in root.descendants.whereType<XmlElement>()) {
+      if (element.name.local == localName) {
+        yield element;
+      }
+    }
   }
 
   ArchiveFile? _findEntry(Archive archive, String path) {
@@ -218,6 +370,43 @@ class FilePickerEpubImportService implements EpubImportService {
     }
     return content.toString();
   }
+
+  String _buildLocalBookId() {
+    final timestamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    return 'book_$timestamp';
+  }
+
+  Future<bool> _isValidEpubSelection({
+    required PlatformFile file,
+    required String filePath,
+  }) async {
+    final extension = p.extension(file.name).toLowerCase();
+    final hasEpubExtension = extension == '.epub';
+
+    final bytes = await File(filePath).readAsBytes();
+    final hasZipHeader = bytes.length >= 4 &&
+        bytes[0] == 0x50 &&
+        bytes[1] == 0x4B &&
+        bytes[2] == 0x03 &&
+        bytes[3] == 0x04;
+    if (!hasZipHeader) {
+      return false;
+    }
+
+    try {
+      final archive = ZipDecoder().decodeBytes(bytes);
+      final hasContainer =
+          _findEntry(archive, 'META-INF/container.xml') != null;
+      final mimetypeEntry = _findEntry(archive, 'mimetype');
+      final mimetypeValue =
+          mimetypeEntry == null ? null : _readString(mimetypeEntry).trim();
+      final hasEpubMimetypeEntry = mimetypeValue == 'application/epub+zip';
+
+      return hasContainer && (hasEpubExtension || hasEpubMimetypeEntry);
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
 class _ParsedEpub {
@@ -234,6 +423,27 @@ class _ParsedEpub {
   final List<Chapter> chapters;
 }
 
+class _ManifestItem {
+  const _ManifestItem({
+    required this.href,
+    this.mediaType,
+    this.properties,
+  });
+
+  final String href;
+  final String? mediaType;
+  final String? properties;
+}
+
 extension _FirstOrNull<E> on Iterable<E> {
   E? get firstOrNull => isEmpty ? null : first;
+}
+
+class EpubImportException implements Exception {
+  const EpubImportException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }

@@ -3,7 +3,7 @@ import 'package:sqflite/sqflite.dart';
 
 class AppDatabase {
   static const _dbName = 'mkreader.db';
-  static const _dbVersion = 1;
+  static const _dbVersion = 2;
 
   Database? _database;
 
@@ -20,6 +20,7 @@ class AppDatabase {
         await db.execute('''
           CREATE TABLE books (
             id TEXT PRIMARY KEY,
+            source_identifier TEXT,
             title TEXT NOT NULL,
             author TEXT,
             description TEXT,
@@ -42,6 +43,13 @@ class AppDatabase {
             updated_at TEXT NOT NULL
           )
         ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+            'ALTER TABLE books ADD COLUMN source_identifier TEXT',
+          );
+        }
       },
     );
     return _database!;
