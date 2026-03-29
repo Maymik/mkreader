@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,6 +11,7 @@ import '../../domain/models/reading_progress.dart';
 import '../controllers/library_controller.dart';
 import '../controllers/reader_settings_controller.dart';
 import '../controllers/reading_progress_controller.dart';
+import '../controllers/simple_text_paginator.dart';
 import '../providers/app_providers.dart';
 
 typedef ChapterTextRequest = ({String epubPath, String chapterHref});
@@ -32,36 +34,26 @@ class ReaderScreen extends ConsumerStatefulWidget {
 }
 
 class _ReaderScreenState extends ConsumerState<ReaderScreen> {
-  final ScrollController _scrollController = ScrollController();
-
   bool _progressInitialized = false;
   int _currentChapterIndex = 0;
-  int _restoredForChapterIndex = -1;
-  double? _pendingRestoreProgress;
-  double _inChapterProgress = 0;
-  List<Chapter> _activeChapters = const [];
+  int _currentPageIndex = 0;
+  int _currentPageCount = 1;
 
-  @override
-  void initState() {
-    super.initState();
-    _scrollController.addListener(() {
-      if (!_scrollController.hasClients) {
-        return;
-      }
-      final maxExtent = _scrollController.position.maxScrollExtent;
-      if (maxExtent <= 0) {
-        _inChapterProgress = 0;
-        return;
-      }
-      _inChapterProgress =
-          (_scrollController.offset / maxExtent).clamp(0.0, 1.0);
-    });
-  }
+  double? _pendingRestoreChapterProgress;
+  int? _pendingStoredPageIndex;
+  int? _pendingStoredPageCount;
+  String? _lastPaginationSignature;
+  List<Chapter> _activeChapters = const [];
+  int _lastKnownTotalPages = 1;
+  String? _precomputeRunningForEnvironment;
+
+  final Map<_ChapterPaginationCacheKey, List<String>> _chapterPagesCache = {};
+  final Map<_ChapterLayoutCacheKey, int> _chapterPageCountCache = {};
+  final Map<String, String> _chapterTextCache = {};
 
   @override
   void dispose() {
     unawaited(_persistCurrentProgress());
-    _scrollController.dispose();
     super.dispose();
   }
 
@@ -127,19 +119,21 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     }
 
     if (!_progressInitialized) {
-      _currentChapterIndex =
-          (progress?.chapterIndex ?? 0).clamp(0, chapters.length - 1);
-      _pendingRestoreProgress = (progress?.progression ?? 0).clamp(0.0, 1.0);
-      _progressInitialized = true;
+      _initializeProgress(progress, chapters.length);
     }
 
     final chapter = chapters[_currentChapterIndex];
-    final chapterTextAsync = ref.watch(
-      chapterTextProvider((
-        epubPath: book.filePath,
-        chapterHref: chapter.href,
-      )),
+    final chapterRequest = (
+      epubPath: book.filePath,
+      chapterHref: chapter.href,
     );
+    final chapterTextAsync = ref.watch(chapterTextProvider(chapterRequest));
+    if (chapterTextAsync.hasValue) {
+      final loadedText = chapterTextAsync.valueOrNull ?? '';
+      _chapterTextCache[chapter.id] = loadedText;
+    }
+    final currentChapterText =
+        _chapterTextCache[chapter.id] ?? chapterTextAsync.valueOrNull;
 
     final colors = _readerColors(settings.theme, Theme.of(context).brightness);
 
@@ -162,73 +156,135 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           children: [
             Text(
               chapter.title,
-              style: Theme.of(context)
-                  .textTheme
-                  .titleLarge
-                  ?.copyWith(color: colors.foreground),
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    color: colors.foreground,
+                  ),
             ),
             const SizedBox(height: 10),
             Expanded(
-              child: chapterTextAsync.when(
-                data: (text) {
-                  _restoreScrollIfNeeded();
-                  if (text.trim().isEmpty) {
-                    return Center(
-                      child: Text(
-                        'Chapter is empty.',
-                        style: TextStyle(color: colors.foreground),
+              child: currentChapterText == null
+                  ? chapterTextAsync.when(
+                      data: (_) => const SizedBox.shrink(),
+                      error: (error, _) => Center(
+                        child: Text(
+                          'Failed to load chapter: $error',
+                          style: TextStyle(color: colors.foreground),
+                        ),
                       ),
-                    );
-                  }
-                  return Scrollbar(
-                    controller: _scrollController,
-                    child: SingleChildScrollView(
-                      controller: _scrollController,
-                      child: Text(
-                        text,
-                        style: TextStyle(
+                      loading: () => const Center(
+                        child: CircularProgressIndicator(),
+                      ),
+                    )
+                  : LayoutBuilder(
+                      builder: (context, constraints) {
+                        final textStyle = TextStyle(
                           fontSize: settings.fontSize,
                           height: 1.6,
                           color: colors.foreground,
-                        ),
-                      ),
+                        );
+
+                        final pages = _getOrCreatePages(
+                          chapter: chapter,
+                          chapterText: currentChapterText,
+                          fontSize: settings.fontSize,
+                          pageMargin: settings.pageMargin,
+                          maxWidth: constraints.maxWidth,
+                          maxHeight: constraints.maxHeight,
+                          textStyle: textStyle,
+                        );
+
+                        final signature = _paginationSignature(
+                          chapterId: chapter.id,
+                          chapterText: currentChapterText,
+                          fontSize: settings.fontSize,
+                          width: constraints.maxWidth,
+                          height: constraints.maxHeight,
+                        );
+                        final pageIndex = _resolveCurrentPageIndex(
+                          signature: signature,
+                          pageCount: pages.length,
+                        );
+
+                        final environmentKey = _buildEnvironmentKey(
+                          fontSize: settings.fontSize,
+                          pageMargin: settings.pageMargin,
+                          width: constraints.maxWidth,
+                          height: constraints.maxHeight,
+                        );
+                        _prefetchAdjacentChapterTexts(
+                          chapters: chapters,
+                          book: book,
+                          centerIndex: _currentChapterIndex,
+                        );
+                        _precomputePageCountsIfNeeded(
+                          chapters: chapters,
+                          book: book,
+                          textStyle: textStyle,
+                          fontSize: settings.fontSize,
+                          pageMargin: settings.pageMargin,
+                          maxWidth: constraints.maxWidth,
+                          maxHeight: constraints.maxHeight,
+                          environmentKey: environmentKey,
+                        );
+
+                        final globalPageStats = _computeGlobalPageStats(
+                          chapters: chapters,
+                          fontSize: settings.fontSize,
+                          pageMargin: settings.pageMargin,
+                          maxWidth: constraints.maxWidth,
+                          maxHeight: constraints.maxHeight,
+                        );
+
+                        final pageText =
+                            (pages.isEmpty || pages[pageIndex].trim().isEmpty)
+                                ? null
+                                : pages[pageIndex];
+
+                        return Column(
+                          children: [
+                            Expanded(
+                              child: pageText == null
+                                  ? Center(
+                                      child: Text(
+                                        'Chapter is empty.',
+                                        style: TextStyle(
+                                          color: colors.foreground,
+                                        ),
+                                      ),
+                                    )
+                                  : Align(
+                                      alignment: Alignment.topLeft,
+                                      child: Text(pageText, style: textStyle),
+                                    ),
+                            ),
+                            const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                OutlinedButton(
+                                  onPressed: () =>
+                                      _goToPreviousPage(chapters.length),
+                                  child: const Text('Previous'),
+                                ),
+                                const SizedBox(width: 8),
+                                OutlinedButton(
+                                  onPressed: () =>
+                                      _goToNextPage(chapters.length),
+                                  child: const Text('Next'),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  'Page ${globalPageStats.currentPage} of ${globalPageStats.totalPages}',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall
+                                      ?.copyWith(color: colors.foreground),
+                                ),
+                              ],
+                            ),
+                          ],
+                        );
+                      },
                     ),
-                  );
-                },
-                error: (error, _) => Center(
-                  child: Text(
-                    'Failed to load chapter: $error',
-                    style: TextStyle(color: colors.foreground),
-                  ),
-                ),
-                loading: () => const Center(child: CircularProgressIndicator()),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                OutlinedButton(
-                  onPressed: _currentChapterIndex == 0
-                      ? null
-                      : () => _changeChapter(_currentChapterIndex - 1),
-                  child: const Text('Previous'),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton(
-                  onPressed: _currentChapterIndex >= chapters.length - 1
-                      ? null
-                      : () => _changeChapter(_currentChapterIndex + 1),
-                  child: const Text('Next'),
-                ),
-                const Spacer(),
-                Text(
-                  '${_currentChapterIndex + 1}/${chapters.length}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: colors.foreground),
-                ),
-              ],
             ),
           ],
         ),
@@ -236,33 +292,125 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     );
   }
 
-  Scaffold _buildStatusScaffold(String message) {
-    return Scaffold(
-      appBar: const _ReaderAppBar(title: 'Reader'),
-      body: Center(child: Text(message)),
-    );
+  void _initializeProgress(ReadingProgress? progress, int chapterCount) {
+    _currentChapterIndex =
+        (progress?.chapterIndex ?? 0).clamp(0, chapterCount - 1);
+    final storedPage = _StoredPageProgress.tryParse(progress?.cfi);
+
+    _pendingRestoreChapterProgress = storedPage?.chapterProgress ??
+        progress?.progression.clamp(0.0, 1.0) ??
+        0;
+    _pendingStoredPageIndex = storedPage?.pageIndex;
+    _pendingStoredPageCount = storedPage?.pageCount;
+
+    _currentPageIndex = 0;
+    _currentPageCount = 1;
+    _lastPaginationSignature = null;
+    _progressInitialized = true;
   }
 
-  void _restoreScrollIfNeeded() {
-    if (_restoredForChapterIndex == _currentChapterIndex) {
+  int _resolveCurrentPageIndex({
+    required String signature,
+    required int pageCount,
+  }) {
+    final safePageCount = pageCount <= 0 ? 1 : pageCount;
+
+    if (_lastPaginationSignature != signature) {
+      final oldProgress = _currentPageCount <= 1
+          ? 0.0
+          : (_currentPageIndex / (_currentPageCount - 1)).clamp(0.0, 1.0);
+
+      final restoredFromStoredPage = _restoredProgressFromStoredPage();
+      final targetProgress = (restoredFromStoredPage ??
+              _pendingRestoreChapterProgress ??
+              oldProgress)
+          .clamp(0.0, 1.0);
+
+      _currentPageCount = safePageCount;
+      _currentPageIndex = (targetProgress * (_currentPageCount - 1)).round();
+      _currentPageIndex = _currentPageIndex.clamp(0, _currentPageCount - 1);
+
+      _pendingRestoreChapterProgress = null;
+      _pendingStoredPageIndex = null;
+      _pendingStoredPageCount = null;
+      _lastPaginationSignature = signature;
+    } else {
+      _currentPageCount = safePageCount;
+      _currentPageIndex = _currentPageIndex.clamp(0, _currentPageCount - 1);
+    }
+
+    return _currentPageIndex;
+  }
+
+  String _paginationSignature({
+    required String chapterId,
+    required String chapterText,
+    required double fontSize,
+    required double width,
+    required double height,
+  }) {
+    return [
+      chapterId,
+      chapterText.hashCode,
+      fontSize.toStringAsFixed(2),
+      width.floor(),
+      height.floor(),
+    ].join('|');
+  }
+
+  Future<void> _goToNextPage(int chapterCount) async {
+    if (_currentPageIndex < _currentPageCount - 1) {
+      setState(() {
+        _currentPageIndex++;
+      });
       return;
     }
 
-    _restoredForChapterIndex = _currentChapterIndex;
-    final restoreProgress = (_pendingRestoreProgress ?? 0).clamp(0.0, 1.0);
-    _pendingRestoreProgress = null;
+    if (_currentChapterIndex >= chapterCount - 1) {
+      return;
+    }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scrollController.hasClients) {
-        return;
-      }
+    await _persistCurrentProgress();
+    if (!mounted) {
+      return;
+    }
 
-      final maxExtent = _scrollController.position.maxScrollExtent;
-      final targetOffset = maxExtent * restoreProgress;
-      _scrollController.jumpTo(targetOffset.clamp(0.0, maxExtent));
-      _inChapterProgress = maxExtent <= 0
-          ? 0
-          : (_scrollController.offset / maxExtent).clamp(0.0, 1.0);
+    setState(() {
+      _currentChapterIndex++;
+      _currentPageIndex = 0;
+      _currentPageCount = 1;
+      _lastPaginationSignature = null;
+      _pendingRestoreChapterProgress = 0;
+      _pendingStoredPageIndex = null;
+      _pendingStoredPageCount = null;
+    });
+  }
+
+  Future<void> _goToPreviousPage(int chapterCount) async {
+    if (_currentPageIndex > 0) {
+      setState(() {
+        _currentPageIndex--;
+      });
+      return;
+    }
+
+    if (_currentChapterIndex <= 0 || chapterCount <= 0) {
+      return;
+    }
+
+    await _persistCurrentProgress();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _currentChapterIndex--;
+      _currentPageIndex = 0;
+      _currentPageCount = 1;
+      _lastPaginationSignature = null;
+      _pendingRestoreChapterProgress = 1.0;
+      _pendingStoredPageIndex = null;
+      _pendingStoredPageCount = null;
     });
   }
 
@@ -296,22 +444,227 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     );
 
     if (selectedIndex != null && selectedIndex != _currentChapterIndex) {
-      await _changeChapter(selectedIndex);
+      await _persistCurrentProgress();
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _currentChapterIndex = selectedIndex;
+        _currentPageIndex = 0;
+        _currentPageCount = 1;
+        _pendingRestoreChapterProgress = 0;
+        _pendingStoredPageIndex = null;
+        _pendingStoredPageCount = null;
+        _lastPaginationSignature = null;
+      });
     }
   }
 
-  Future<void> _changeChapter(int newIndex) async {
-    await _persistCurrentProgress();
-    if (!mounted) {
+  List<String> _getOrCreatePages({
+    required Chapter chapter,
+    required String chapterText,
+    required double fontSize,
+    required double pageMargin,
+    required double maxWidth,
+    required double maxHeight,
+    required TextStyle textStyle,
+  }) {
+    final environmentKey = _buildEnvironmentKey(
+      fontSize: fontSize,
+      pageMargin: pageMargin,
+      width: maxWidth,
+      height: maxHeight,
+    );
+    final cacheKey = _ChapterPaginationCacheKey(
+      chapterId: chapter.id,
+      environmentKey: environmentKey,
+      textHash: chapterText.hashCode,
+    );
+    final cached = _chapterPagesCache[cacheKey];
+    if (cached != null) {
+      return cached;
+    }
+
+    final pages = SimpleTextPaginator.paginate(
+      text: chapterText,
+      style: textStyle,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+    );
+    _chapterPagesCache[cacheKey] = pages;
+    _chapterPageCountCache[_ChapterLayoutCacheKey(
+      chapterId: chapter.id,
+      environmentKey: environmentKey,
+    )] = pages.isEmpty ? 1 : pages.length;
+    return pages;
+  }
+
+  String _buildEnvironmentKey({
+    required double fontSize,
+    required double pageMargin,
+    required double width,
+    required double height,
+  }) {
+    return '${fontSize.toStringAsFixed(2)}|${pageMargin.toStringAsFixed(2)}|${width.floor()}|${height.floor()}';
+  }
+
+  void _prefetchAdjacentChapterTexts({
+    required List<Chapter> chapters,
+    required Book book,
+    required int centerIndex,
+  }) {
+    for (final adjacentIndex in [centerIndex - 1, centerIndex + 1]) {
+      if (adjacentIndex < 0 || adjacentIndex >= chapters.length) {
+        continue;
+      }
+      final chapter = chapters[adjacentIndex];
+      if (_chapterTextCache.containsKey(chapter.id)) {
+        continue;
+      }
+
+      final request = (
+        epubPath: book.filePath,
+        chapterHref: chapter.href,
+      );
+      unawaited(
+        ref.read(chapterTextProvider(request).future).then((text) {
+          _chapterTextCache[chapter.id] = text;
+        }).catchError((_) {}),
+      );
+    }
+  }
+
+  void _precomputePageCountsIfNeeded({
+    required List<Chapter> chapters,
+    required Book book,
+    required TextStyle textStyle,
+    required double fontSize,
+    required double pageMargin,
+    required double maxWidth,
+    required double maxHeight,
+    required String environmentKey,
+  }) {
+    if (_precomputeRunningForEnvironment == environmentKey) {
       return;
     }
 
-    setState(() {
-      _currentChapterIndex = newIndex;
-      _pendingRestoreProgress = 0;
-      _restoredForChapterIndex = -1;
-      _inChapterProgress = 0;
+    final hasUnknownChapter = chapters.any((chapter) {
+      return !_chapterPageCountCache.containsKey(
+        _ChapterLayoutCacheKey(
+          chapterId: chapter.id,
+          environmentKey: environmentKey,
+        ),
+      );
     });
+    if (!hasUnknownChapter) {
+      return;
+    }
+
+    _precomputeRunningForEnvironment = environmentKey;
+    unawaited(() async {
+      try {
+        for (final chapter in chapters) {
+          if (!_chapterPageCountCache.containsKey(
+            _ChapterLayoutCacheKey(
+              chapterId: chapter.id,
+              environmentKey: environmentKey,
+            ),
+          )) {
+            var chapterText = _chapterTextCache[chapter.id];
+            if (chapterText == null) {
+              try {
+                final loadedChapterText = await ref.read(
+                  chapterTextProvider((
+                    epubPath: book.filePath,
+                    chapterHref: chapter.href,
+                  )).future,
+                );
+                chapterText = loadedChapterText;
+                _chapterTextCache[chapter.id] = loadedChapterText;
+              } catch (_) {
+                // Keep a conservative fallback count when chapter text cannot be loaded now.
+                _chapterPageCountCache[_ChapterLayoutCacheKey(
+                  chapterId: chapter.id,
+                  environmentKey: environmentKey,
+                )] = 1;
+                continue;
+              }
+            }
+            _getOrCreatePages(
+              chapter: chapter,
+              chapterText: chapterText,
+              fontSize: fontSize,
+              pageMargin: pageMargin,
+              maxWidth: maxWidth,
+              maxHeight: maxHeight,
+              textStyle: textStyle,
+            );
+          }
+        }
+      } finally {
+        _precomputeRunningForEnvironment = null;
+        if (mounted) {
+          setState(() {});
+        }
+      }
+    }());
+  }
+
+  _GlobalPageStats _computeGlobalPageStats({
+    required List<Chapter> chapters,
+    required double fontSize,
+    required double pageMargin,
+    required double maxWidth,
+    required double maxHeight,
+  }) {
+    final environmentKey = _buildEnvironmentKey(
+      fontSize: fontSize,
+      pageMargin: pageMargin,
+      width: maxWidth,
+      height: maxHeight,
+    );
+
+    var totalPages = 0;
+    var pagesBeforeCurrent = 0;
+
+    for (var index = 0; index < chapters.length; index++) {
+      final chapter = chapters[index];
+      final pageCountForChapter = index == _currentChapterIndex
+          ? _currentPageCount
+          : (_chapterPageCountCache[_ChapterLayoutCacheKey(
+                chapterId: chapter.id,
+                environmentKey: environmentKey,
+              )] ??
+              1);
+
+      if (index < _currentChapterIndex) {
+        pagesBeforeCurrent += pageCountForChapter;
+      }
+      totalPages += pageCountForChapter;
+    }
+
+    if (totalPages > 0) {
+      _lastKnownTotalPages = totalPages;
+    }
+    final safeTotalPages = totalPages <= 0 ? _lastKnownTotalPages : totalPages;
+    final currentGlobalPage =
+        (pagesBeforeCurrent + _currentPageIndex + 1).clamp(1, safeTotalPages);
+    return _GlobalPageStats(
+      currentPage: currentGlobalPage,
+      totalPages: safeTotalPages <= 0 ? 1 : safeTotalPages,
+    );
+  }
+
+  double? _restoredProgressFromStoredPage() {
+    if (_pendingStoredPageIndex == null || _pendingStoredPageCount == null) {
+      return null;
+    }
+    if (_pendingStoredPageCount! <= 1) {
+      return 0;
+    }
+    return (_pendingStoredPageIndex! / (_pendingStoredPageCount! - 1))
+        .clamp(0.0, 1.0);
   }
 
   Future<void> _persistCurrentProgress() async {
@@ -319,17 +672,37 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
 
-    final safeIndex = _currentChapterIndex.clamp(0, _activeChapters.length - 1);
-    final chapter = _activeChapters[safeIndex];
+    final safeChapterIndex =
+        _currentChapterIndex.clamp(0, _activeChapters.length - 1);
+    final chapter = _activeChapters[safeChapterIndex];
+
+    final chapterProgress = _currentPageCount <= 1
+        ? 0.0
+        : (_currentPageIndex / (_currentPageCount - 1)).clamp(0.0, 1.0);
+
+    final marker = _StoredPageProgress(
+      pageIndex: _currentPageIndex,
+      pageCount: _currentPageCount,
+      chapterProgress: chapterProgress,
+    );
+
     final progress = ReadingProgress(
       bookId: widget.bookId,
       chapterId: chapter.id,
-      chapterIndex: safeIndex,
-      progression: _inChapterProgress.clamp(0.0, 1.0),
+      chapterIndex: safeChapterIndex,
+      progression: chapterProgress,
+      cfi: marker.toJsonString(),
       updatedAt: DateTime.now(),
     );
 
     await ref.read(readingProgressControllerProvider).saveProgress(progress);
+  }
+
+  Scaffold _buildStatusScaffold(String message) {
+    return Scaffold(
+      appBar: const _ReaderAppBar(title: 'Reader'),
+      body: Center(child: Text(message)),
+    );
   }
 
   _ReaderColors _readerColors(
@@ -363,6 +736,108 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         );
     }
   }
+}
+
+class _StoredPageProgress {
+  const _StoredPageProgress({
+    required this.pageIndex,
+    required this.pageCount,
+    required this.chapterProgress,
+  });
+
+  final int pageIndex;
+  final int pageCount;
+  final double chapterProgress;
+
+  String toJsonString() {
+    return jsonEncode({
+      'pageIndex': pageIndex,
+      'pageCount': pageCount,
+      'chapterProgress': chapterProgress,
+    });
+  }
+
+  static _StoredPageProgress? tryParse(String? raw) {
+    if (raw == null || raw.isEmpty) {
+      return null;
+    }
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) {
+        return null;
+      }
+      final pageIndex = decoded['pageIndex'];
+      final pageCount = decoded['pageCount'];
+      final chapterProgress = decoded['chapterProgress'];
+
+      if (pageIndex is! num || pageCount is! num || chapterProgress is! num) {
+        return null;
+      }
+
+      return _StoredPageProgress(
+        pageIndex: pageIndex.toInt(),
+        pageCount: pageCount.toInt(),
+        chapterProgress: chapterProgress.toDouble().clamp(0.0, 1.0),
+      );
+    } catch (_) {
+      // TODO: Migrate legacy progress markers if old formats are introduced.
+      return null;
+    }
+  }
+}
+
+class _GlobalPageStats {
+  const _GlobalPageStats({
+    required this.currentPage,
+    required this.totalPages,
+  });
+
+  final int currentPage;
+  final int totalPages;
+}
+
+class _ChapterPaginationCacheKey {
+  const _ChapterPaginationCacheKey({
+    required this.chapterId,
+    required this.environmentKey,
+    required this.textHash,
+  });
+
+  final String chapterId;
+  final String environmentKey;
+  final int textHash;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _ChapterPaginationCacheKey &&
+        other.chapterId == chapterId &&
+        other.environmentKey == environmentKey &&
+        other.textHash == textHash;
+  }
+
+  @override
+  int get hashCode => Object.hash(chapterId, environmentKey, textHash);
+}
+
+class _ChapterLayoutCacheKey {
+  const _ChapterLayoutCacheKey({
+    required this.chapterId,
+    required this.environmentKey,
+  });
+
+  final String chapterId;
+  final String environmentKey;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _ChapterLayoutCacheKey &&
+        other.chapterId == chapterId &&
+        other.environmentKey == environmentKey;
+  }
+
+  @override
+  int get hashCode => Object.hash(chapterId, environmentKey);
 }
 
 class _ReaderColors {
