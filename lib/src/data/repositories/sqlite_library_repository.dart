@@ -57,6 +57,16 @@ class SqliteLibraryRepository implements LibraryRepository {
     return rows.map(_mapBook).toList();
   }
 
+  @override
+  Future<void> deleteBook(String bookId) async {
+    final db = await _database.instance;
+    await db.delete(
+      'books',
+      where: 'id = ?',
+      whereArgs: [bookId],
+    );
+  }
+
   Book _mapBook(Map<String, Object?> row) {
     final tocRaw = row['toc_json'] as String?;
     final decoded = tocRaw == null

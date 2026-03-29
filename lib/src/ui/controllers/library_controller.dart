@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../domain/models/book.dart';
+import 'reading_progress_controller.dart';
 import '../providers/app_providers.dart';
 
 final libraryControllerProvider =
@@ -29,6 +30,26 @@ class LibraryController extends AsyncNotifier<List<Book>> {
       return null;
     } catch (error) {
       return error.toString();
+    }
+  }
+
+  Future<String?> deleteBook(String bookId) async {
+    final previousBooks = state.valueOrNull ?? const <Book>[];
+    state = AsyncData(
+      previousBooks.where((book) => book.id != bookId).toList(),
+    );
+
+    try {
+      await ref.read(libraryRepositoryProvider).deleteBook(bookId);
+      await ref.read(readingProgressRepositoryProvider).deleteProgressForBook(
+            bookId,
+          );
+      ref.invalidate(bookByIdProvider(bookId));
+      ref.invalidate(readingProgressProvider(bookId));
+      return null;
+    } catch (error) {
+      state = AsyncData(previousBooks);
+      return 'Failed to delete book: $error';
     }
   }
 }

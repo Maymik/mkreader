@@ -53,10 +53,40 @@ class LibraryScreen extends ConsumerWidget {
               return ListTile(
                 title: Text(book.title),
                 subtitle: Text(book.author ?? 'Unknown author'),
-                trailing: IconButton(
-                  icon: const Icon(Icons.menu_book),
-                  onPressed: () => context.push(AppRoutes.readerPath(book.id)),
-                  tooltip: 'Read',
+                trailing: Wrap(
+                  spacing: 4,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.menu_book),
+                      onPressed: () =>
+                          context.push(AppRoutes.readerPath(book.id)),
+                      tooltip: 'Read',
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline),
+                      onPressed: () async {
+                        final shouldDelete =
+                            await _confirmDelete(context, book.title);
+                        if (!context.mounted || shouldDelete != true) {
+                          return;
+                        }
+                        final error = await ref
+                            .read(libraryControllerProvider.notifier)
+                            .deleteBook(book.id);
+                        if (!context.mounted) {
+                          return;
+                        }
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              error ?? 'Deleted "${book.title}"',
+                            ),
+                          ),
+                        );
+                      },
+                      tooltip: 'Delete',
+                    ),
+                  ],
                 ),
                 onTap: () => context.push(AppRoutes.readerPath(book.id)),
               );
@@ -67,6 +97,28 @@ class LibraryScreen extends ConsumerWidget {
             Center(child: Text('Failed to load library: $error')),
         loading: () => const Center(child: CircularProgressIndicator()),
       ),
+    );
+  }
+
+  Future<bool?> _confirmDelete(BuildContext context, String title) {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Delete book?'),
+          content: Text('Remove "$title" from your local library?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
     );
   }
 }

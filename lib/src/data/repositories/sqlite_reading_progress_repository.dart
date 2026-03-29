@@ -51,4 +51,14 @@ class SqliteReadingProgressRepository implements ReadingProgressRepository {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
+
+  @override
+  Future<void> deleteProgressForBook(String bookId) async {
+    final db = await _database.instance;
+    await db.delete(
+      'reading_progress',
+      where: 'book_id = ?',
+      whereArgs: [bookId],
+    );
+  }
 }
