@@ -2,10 +2,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/persistence/app_database.dart';
 import '../../data/repositories/shared_prefs_reader_settings_repository.dart';
+import '../../data/repositories/sqlite_bookmark_repository.dart';
 import '../../data/repositories/sqlite_library_repository.dart';
 import '../../data/repositories/sqlite_reading_progress_repository.dart';
 import '../../data/services/epub_content_service.dart';
 import '../../data/services/file_picker_epub_import_service.dart';
+import '../../domain/repositories/bookmark_repository.dart';
 import '../../domain/repositories/library_repository.dart';
 import '../../domain/repositories/reader_settings_repository.dart';
 import '../../domain/repositories/reading_progress_repository.dart';
@@ -22,6 +24,10 @@ final libraryRepositoryProvider = Provider<LibraryRepository>((ref) {
 final readingProgressRepositoryProvider =
     Provider<ReadingProgressRepository>((ref) {
   return SqliteReadingProgressRepository(ref.read(appDatabaseProvider));
+});
+
+final bookmarkRepositoryProvider = Provider<BookmarkRepository>((ref) {
+  return SqliteBookmarkRepository(ref.read(appDatabaseProvider));
 });
 
 final readerSettingsRepositoryProvider =

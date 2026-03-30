@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../domain/models/book.dart';
+import 'bookmark_controller.dart';
 import 'reading_progress_controller.dart';
 import '../providers/app_providers.dart';
 
@@ -44,8 +45,10 @@ class LibraryController extends AsyncNotifier<List<Book>> {
       await ref.read(readingProgressRepositoryProvider).deleteProgressForBook(
             bookId,
           );
+      await ref.read(bookmarkRepositoryProvider).deleteBookmarksForBook(bookId);
       ref.invalidate(bookByIdProvider(bookId));
       ref.invalidate(readingProgressProvider(bookId));
+      ref.invalidate(bookmarksForBookProvider(bookId));
       return null;
     } catch (error) {
       state = AsyncData(previousBooks);

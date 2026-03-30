@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../domain/models/book.dart';
+import '../../domain/models/bookmark.dart';
 import '../../domain/models/chapter.dart';
 import '../../domain/models/reader_settings.dart';
 import '../../domain/models/reading_progress.dart';
+import '../controllers/bookmark_controller.dart';
 import '../controllers/library_controller.dart';
 import '../controllers/reader_settings_controller.dart';
 import '../controllers/reading_progress_controller.dart';
@@ -50,6 +52,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   final Map<_ChapterPaginationCacheKey, List<String>> _chapterPagesCache = {};
   final Map<_ChapterLayoutCacheKey, int> _chapterPageCountCache = {};
   final Map<String, String> _chapterTextCache = {};
+  String _currentPageText = '';
 
   @override
   void dispose() {
@@ -141,6 +144,16 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       appBar: AppBar(
         title: Text(book.title),
         actions: [
+          IconButton(
+            onPressed: () => _addBookmark(context),
+            icon: const Icon(Icons.bookmark_add_outlined),
+            tooltip: 'Add bookmark',
+          ),
+          IconButton(
+            onPressed: () => _showBookmarksSheet(context),
+            icon: const Icon(Icons.bookmarks_outlined),
+            tooltip: 'Bookmarks',
+          ),
           IconButton(
             onPressed: () => _showTableOfContents(context, chapters),
             icon: const Icon(Icons.list),
@@ -239,6 +252,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                             (pages.isEmpty || pages[pageIndex].trim().isEmpty)
                                 ? null
                                 : pages[pageIndex];
+                        _currentPageText = pageText ?? '';
 
                         return Column(
                           children: [
@@ -459,6 +473,168 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         _lastPaginationSignature = null;
       });
     }
+  }
+
+  Future<void> _addBookmark(BuildContext context) async {
+    if (_activeChapters.isEmpty) {
+      return;
+    }
+
+    final safeChapterIndex =
+        _currentChapterIndex.clamp(0, _activeChapters.length - 1);
+    final chapter = _activeChapters[safeChapterIndex];
+    final chapterProgress = _currentPageCount <= 1
+        ? 0.0
+        : (_currentPageIndex / (_currentPageCount - 1)).clamp(0.0, 1.0);
+    final marker = _StoredPageProgress(
+      pageIndex: _currentPageIndex,
+      pageCount: _currentPageCount,
+      chapterProgress: chapterProgress,
+    );
+
+    final bookmark = Bookmark(
+      id: 'bm_${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}',
+      bookId: widget.bookId,
+      chapterId: chapter.id,
+      chapterIndex: safeChapterIndex,
+      positionCfi: marker.toJsonString(),
+      note: _buildBookmarkSnippet(chapter),
+      createdAt: DateTime.now(),
+    );
+
+    final error =
+        await ref.read(bookmarkControllerProvider).addBookmark(bookmark);
+    if (!context.mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(error ?? 'Bookmark added'),
+      ),
+    );
+  }
+
+  Future<void> _showBookmarksSheet(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return Consumer(
+          builder: (context, ref, _) {
+            final bookmarksAsync = ref.watch(
+              bookmarksForBookProvider(widget.bookId),
+            );
+
+            return SizedBox(
+              height: MediaQuery.of(context).size.height * 0.6,
+              child: bookmarksAsync.when(
+                data: (bookmarks) {
+                  if (bookmarks.isEmpty) {
+                    return const Center(
+                      child: Text('No bookmarks yet.'),
+                    );
+                  }
+
+                  return ListView.separated(
+                    itemCount: bookmarks.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final bookmark = bookmarks[index];
+                      final marker =
+                          _StoredPageProgress.tryParse(bookmark.positionCfi);
+                      final pageLabel = marker == null
+                          ? ''
+                          : 'Page ${marker.pageIndex + 1}/${marker.pageCount}';
+
+                      return ListTile(
+                        title: Text(
+                          bookmark.note ??
+                              'Chapter ${bookmark.chapterIndex + 1}',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          pageLabel.isEmpty
+                              ? 'Chapter ${bookmark.chapterIndex + 1}'
+                              : 'Chapter ${bookmark.chapterIndex + 1} • $pageLabel',
+                        ),
+                        onTap: () async {
+                          Navigator.of(context).pop();
+                          await _jumpToBookmark(bookmark);
+                        },
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          tooltip: 'Delete bookmark',
+                          onPressed: () async {
+                            final error = await ref
+                                .read(bookmarkControllerProvider)
+                                .deleteBookmark(
+                                  bookmarkId: bookmark.id,
+                                  bookId: widget.bookId,
+                                );
+                            if (!context.mounted) {
+                              return;
+                            }
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(error ?? 'Bookmark deleted'),
+                              ),
+                            );
+                          },
+                        ),
+                      );
+                    },
+                  );
+                },
+                error: (error, _) => Center(
+                  child: Text('Failed to load bookmarks: $error'),
+                ),
+                loading: () => const Center(child: CircularProgressIndicator()),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _jumpToBookmark(Bookmark bookmark) async {
+    if (_activeChapters.isEmpty) {
+      return;
+    }
+
+    final targetChapterIndex =
+        bookmark.chapterIndex.clamp(0, _activeChapters.length - 1);
+    final marker = _StoredPageProgress.tryParse(bookmark.positionCfi);
+
+    await _persistCurrentProgress();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _currentChapterIndex = targetChapterIndex;
+      _currentPageIndex = 0;
+      _currentPageCount = 1;
+      _lastPaginationSignature = null;
+      _pendingRestoreChapterProgress = marker?.chapterProgress ?? 0;
+      _pendingStoredPageIndex = marker?.pageIndex;
+      _pendingStoredPageCount = marker?.pageCount;
+    });
+  }
+
+  String _buildBookmarkSnippet(Chapter chapter) {
+    final normalized = _currentPageText.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.isEmpty) {
+      return chapter.title;
+    }
+    const maxLen = 100;
+    if (normalized.length <= maxLen) {
+      return normalized;
+    }
+    return '${normalized.substring(0, maxLen)}...';
   }
 
   List<String> _getOrCreatePages({
