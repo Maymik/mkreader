@@ -3,7 +3,7 @@ import 'package:sqflite/sqflite.dart';
 
 class AppDatabase {
   static const _dbName = 'mkreader.db';
-  static const _dbVersion = 2;
+  static const _dbVersion = 3;
 
   Database? _database;
 
@@ -43,11 +43,42 @@ class AppDatabase {
             updated_at TEXT NOT NULL
           )
         ''');
+
+        await db.execute('''
+          CREATE TABLE bookmarks (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL,
+            chapter_id TEXT,
+            chapter_index INTEGER NOT NULL,
+            position_cfi TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+          )
+        ''');
+        await db.execute(
+          'CREATE INDEX idx_bookmarks_book_id ON bookmarks(book_id)',
+        );
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
           await db.execute(
             'ALTER TABLE books ADD COLUMN source_identifier TEXT',
+          );
+        }
+        if (oldVersion < 3) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS bookmarks (
+              id TEXT PRIMARY KEY,
+              book_id TEXT NOT NULL,
+              chapter_id TEXT,
+              chapter_index INTEGER NOT NULL,
+              position_cfi TEXT,
+              note TEXT,
+              created_at TEXT NOT NULL
+            )
+          ''');
+          await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_bookmarks_book_id ON bookmarks(book_id)',
           );
         }
       },
