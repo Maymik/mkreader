@@ -52,6 +52,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   final Map<_ChapterPaginationCacheKey, List<String>> _chapterPagesCache = {};
   final Map<_ChapterLayoutCacheKey, int> _chapterPageCountCache = {};
   final Map<String, String> _chapterTextCache = {};
+  final Map<String, List<_BookSearchResult>> _searchResultsCache = {};
   String _currentPageText = '';
 
   @override
@@ -133,7 +134,16 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final chapterTextAsync = ref.watch(chapterTextProvider(chapterRequest));
     if (chapterTextAsync.hasValue) {
       final loadedText = chapterTextAsync.valueOrNull ?? '';
-      _chapterTextCache[chapter.id] = loadedText;
+      if (_isChapterLoadFailureText(loadedText)) {
+        _chapterTextCache.remove(chapter.id);
+        debugPrint(
+          'ReaderScreen: chapter load failure '
+          '(bookId=${book.id}, chapterId=${chapter.id}, href=${chapter.href}) '
+          'message="$loadedText"',
+        );
+      } else {
+        _chapterTextCache[chapter.id] = loadedText;
+      }
     }
     final currentChapterText =
         _chapterTextCache[chapter.id] ?? chapterTextAsync.valueOrNull;
@@ -144,6 +154,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       appBar: AppBar(
         title: Text(book.title),
         actions: [
+          IconButton(
+            onPressed: () => _showSearchSheet(context, book, chapters),
+            icon: const Icon(Icons.search),
+            tooltip: 'Search in book',
+          ),
           IconButton(
             onPressed: () => _addBookmark(context),
             icon: const Icon(Icons.bookmark_add_outlined),
@@ -637,6 +652,168 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     return '${normalized.substring(0, maxLen)}...';
   }
 
+  Future<void> _showSearchSheet(
+    BuildContext context,
+    Book book,
+    List<Chapter> chapters,
+  ) async {
+    final selectedResult = await showModalBottomSheet<_BookSearchResult>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return _SearchSheet(
+          onSearch: (query) {
+            return _searchInBook(
+              query: query,
+              book: book,
+              chapters: chapters,
+            );
+          },
+        );
+      },
+    );
+
+    if (selectedResult == null) {
+      return;
+    }
+
+    FocusManager.instance.primaryFocus?.unfocus();
+    if (!mounted) {
+      return;
+    }
+
+    // Ensure modal route + keyboard teardown completes before reader state writes.
+    await Future<void>.delayed(Duration.zero);
+    await WidgetsBinding.instance.endOfFrame;
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted) {
+      return;
+    }
+
+    await _jumpToSearchResult(selectedResult);
+  }
+
+  Future<List<_BookSearchResult>> _searchInBook({
+    required String query,
+    required Book book,
+    required List<Chapter> chapters,
+  }) async {
+    final normalizedQuery = query.trim().toLowerCase();
+    if (normalizedQuery.isEmpty) {
+      return const [];
+    }
+
+    final cached = _searchResultsCache[normalizedQuery];
+    if (cached != null) {
+      return cached;
+    }
+
+    const maxTotalResults = 300;
+    final results = <_BookSearchResult>[];
+
+    for (var chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
+      final chapter = chapters[chapterIndex];
+      final cachedText = _chapterTextCache[chapter.id];
+      final chapterText = (cachedText ??
+          await ref.read(
+            chapterTextProvider((
+              epubPath: book.filePath,
+              chapterHref: chapter.href,
+            )).future,
+          ))!;
+      if (cachedText == null) {
+        _chapterTextCache[chapter.id] = chapterText;
+      }
+      if (_isChapterLoadFailureText(chapterText)) {
+        debugPrint(
+          'ReaderScreen: skipping search for unreadable chapter '
+          '(bookId=${book.id}, chapterId=${chapter.id}, href=${chapter.href}) '
+          'message="$chapterText"',
+        );
+        continue;
+      }
+
+      final lowerText = chapterText.toLowerCase();
+      var startAt = 0;
+      while (true) {
+        final matchIndex = lowerText.indexOf(normalizedQuery, startAt);
+        if (matchIndex < 0) {
+          break;
+        }
+
+        results.add(
+          _BookSearchResult(
+            chapterIndex: chapterIndex,
+            chapterId: chapter.id,
+            chapterTitle: chapter.title,
+            matchIndex: matchIndex,
+            snippet: _buildSearchSnippet(
+              fullText: chapterText,
+              matchIndex: matchIndex,
+              matchLength: normalizedQuery.length,
+            ),
+          ),
+        );
+
+        if (results.length >= maxTotalResults) {
+          _searchResultsCache[normalizedQuery] = results;
+          return results;
+        }
+
+        startAt = matchIndex + normalizedQuery.length;
+      }
+    }
+
+    _searchResultsCache[normalizedQuery] = results;
+    return results;
+  }
+
+  String _buildSearchSnippet({
+    required String fullText,
+    required int matchIndex,
+    required int matchLength,
+  }) {
+    const contextRadius = 45;
+    final start = (matchIndex - contextRadius).clamp(0, fullText.length);
+    final end =
+        (matchIndex + matchLength + contextRadius).clamp(0, fullText.length);
+    final raw = fullText.substring(start, end).replaceAll(RegExp(r'\s+'), ' ');
+    return raw.trim();
+  }
+
+  bool _isChapterLoadFailureText(String text) {
+    return text.startsWith('Failed to read chapter content:');
+  }
+
+  Future<void> _jumpToSearchResult(_BookSearchResult result) async {
+    if (_activeChapters.isEmpty) {
+      return;
+    }
+
+    final targetChapterIndex =
+        result.chapterIndex.clamp(0, _activeChapters.length - 1);
+    final chapterText = _chapterTextCache[result.chapterId];
+    final chapterProgress = (chapterText == null || chapterText.isEmpty)
+        ? 0.0
+        : (result.matchIndex / chapterText.length).clamp(0.0, 1.0);
+
+    await _persistCurrentProgress();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _currentChapterIndex = targetChapterIndex;
+      _currentPageIndex = 0;
+      _currentPageCount = 1;
+      _lastPaginationSignature = null;
+      _pendingRestoreChapterProgress = chapterProgress;
+      _pendingStoredPageIndex = null;
+      _pendingStoredPageCount = null;
+    });
+  }
+
   List<String> _getOrCreatePages({
     required Chapter chapter,
     required String chapterText,
@@ -971,6 +1148,161 @@ class _GlobalPageStats {
 
   final int currentPage;
   final int totalPages;
+}
+
+class _SearchSheet extends StatefulWidget {
+  const _SearchSheet({
+    required this.onSearch,
+  });
+
+  final Future<List<_BookSearchResult>> Function(String query) onSearch;
+
+  @override
+  State<_SearchSheet> createState() => _SearchSheetState();
+}
+
+class _SearchSheetState extends State<_SearchSheet> {
+  final TextEditingController _queryController = TextEditingController();
+
+  bool _isSearching = false;
+  String? _error;
+  List<_BookSearchResult> _results = const [];
+  int _searchToken = 0;
+
+  @override
+  void dispose() {
+    _searchToken++;
+    _queryController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runSearch() async {
+    final query = _queryController.text.trim();
+    FocusScope.of(context).unfocus();
+    final requestToken = ++_searchToken;
+
+    if (query.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = null;
+        _isSearching = false;
+        _results = const [];
+      });
+      return;
+    }
+
+    setState(() {
+      _isSearching = true;
+      _error = null;
+    });
+
+    try {
+      final searchResults = await widget.onSearch(query);
+      if (!mounted || requestToken != _searchToken) {
+        return;
+      }
+      setState(() {
+        _results = searchResults;
+      });
+    } catch (e) {
+      if (!mounted || requestToken != _searchToken) {
+        return;
+      }
+      setState(() {
+        _error = 'Search failed: $e';
+      });
+    } finally {
+      if (mounted && requestToken == _searchToken) {
+        setState(() {
+          _isSearching = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 12, 16, bottomInset + 16),
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.75,
+        child: Column(
+          children: [
+            TextField(
+              controller: _queryController,
+              autofocus: true,
+              textInputAction: TextInputAction.search,
+              decoration: InputDecoration(
+                labelText: 'Search text',
+                hintText: 'Enter a word or phrase',
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Search',
+                  onPressed: _isSearching ? null : _runSearch,
+                ),
+              ),
+              onSubmitted: (_) => _isSearching ? null : _runSearch(),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: _isSearching
+                  ? const Center(child: CircularProgressIndicator())
+                  : _error != null
+                      ? Center(child: Text(_error!))
+                      : _results.isEmpty
+                          ? const Center(child: Text('No results yet.'))
+                          : ListView.separated(
+                              itemCount: _results.length,
+                              separatorBuilder: (_, __) =>
+                                  const Divider(height: 1),
+                              itemBuilder: (context, index) {
+                                final result = _results[index];
+                                return ListTile(
+                                  title: Text(
+                                    result.chapterTitle.isEmpty
+                                        ? 'Chapter ${result.chapterIndex + 1}'
+                                        : result.chapterTitle,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  subtitle: Text(
+                                    result.snippet,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  onTap: () {
+                                    FocusScope.of(context).unfocus();
+                                    Navigator.of(context).pop(result);
+                                  },
+                                );
+                              },
+                            ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _BookSearchResult {
+  const _BookSearchResult({
+    required this.chapterIndex,
+    required this.chapterId,
+    required this.chapterTitle,
+    required this.matchIndex,
+    required this.snippet,
+  });
+
+  final int chapterIndex;
+  final String chapterId;
+  final String chapterTitle;
+  final int matchIndex;
+  final String snippet;
 }
 
 class _ChapterPaginationCacheKey {
