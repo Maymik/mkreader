@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:xml/xml.dart';
 
 import '../../domain/models/book.dart';
@@ -45,6 +46,10 @@ class FilePickerEpubImportService implements EpubImportService {
     final parserResult = await _parseEpub(pickedPath);
     final fallbackTitle = p.basenameWithoutExtension(pickedPath);
     final bookId = _buildLocalBookId();
+    final persistedFilePath = await _persistEpubFile(
+      sourcePath: pickedPath,
+      bookId: bookId,
+    );
     final normalizedSourceIdentifier = parserResult.identifier?.trim();
     final sourceIdentifier = (normalizedSourceIdentifier != null &&
             normalizedSourceIdentifier.isNotEmpty)
@@ -78,7 +83,7 @@ class FilePickerEpubImportService implements EpubImportService {
       author: parserResult.author?.trim().isNotEmpty == true
           ? parserResult.author!.trim()
           : 'Unknown author',
-      filePath: pickedPath,
+      filePath: persistedFilePath,
       importedAt: DateTime.now(),
       chapters: chapters,
     );
@@ -374,6 +379,36 @@ class FilePickerEpubImportService implements EpubImportService {
   String _buildLocalBookId() {
     final timestamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
     return 'book_$timestamp';
+  }
+
+  Future<String> _persistEpubFile({
+    required String sourcePath,
+    required String bookId,
+  }) async {
+    final sourceFile = File(sourcePath);
+    if (!await sourceFile.exists()) {
+      throw const EpubImportException(
+        'Selected EPUB file is no longer available.',
+      );
+    }
+
+    final appSupportDir = await getApplicationSupportDirectory();
+    final booksDir = Directory(p.join(appSupportDir.path, 'books'));
+    if (!await booksDir.exists()) {
+      await booksDir.create(recursive: true);
+    }
+
+    final safeId = bookId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+    final baseName = 'epub_$safeId';
+    var targetPath = p.join(booksDir.path, '$baseName.epub');
+    var counter = 1;
+    while (await File(targetPath).exists()) {
+      targetPath = p.join(booksDir.path, '${baseName}_$counter.epub');
+      counter++;
+    }
+
+    await sourceFile.copy(targetPath);
+    return targetPath;
   }
 
   Future<bool> _isValidEpubSelection({
